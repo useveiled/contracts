@@ -1,0 +1,17 @@
+# Anchor / Solana
+.anchor/
+target/
+test-ledger/
+
+# Dependencies
+node_modules/
+
+# Local environment
+.env
+.env.*
+!.env.example
+deploy-wallet-devnet.json
+scripts/devnet/.devnet-progress.json
+
+# OS
+.DS_Store
