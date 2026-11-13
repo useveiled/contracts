@@ -441,6 +441,600 @@ pub mod veiled {
         });
         Ok(())
     }
+
+    // ---- Agents, vaults and spending ----
+
+    /// Sets up a new agent for the signer: the agent account with its limits,
+    /// plus a vault for one settlement mint that only this program can move
+    /// funds out of. `agent_signer` is the public key the agent will sign its
+    /// payments with. The agent starts out active.
+    #[allow(clippy::too_many_arguments)]
+    pub fn create_agent(
+        ctx: Context<CreateAgent>,
+        agent_signer: Pubkey,
+        label: String,
+        autonomy_tier: AutonomyTier,
+        per_tx_limit: u64,
+        daily_limit: u64,
+        hitl_threshold: u64,
+        allowlist_enabled: bool,
+        allowed_recipients: Vec<Pubkey>,
+    ) -> Result<()> {
+        require!(agent_signer != Pubkey::default(), VeiledError::InvalidFeeConfig);
+        require!(
+            !label.is_empty() && label.len() <= MAX_LABEL_LEN,
+            VeiledError::InvalidLabelLength
+        );
+        validate_limits(
+            per_tx_limit,
+            daily_limit,
+            hitl_threshold,
+            allowlist_enabled,
+            allowed_recipients.len(),
+        )?;
+        let now = Clock::get()?.unix_timestamp;
+
+        let agent = &mut ctx.accounts.agent;
+        agent.owner = ctx.accounts.owner.key();
+        agent.agent_signer = agent_signer;
+        agent.label = label.clone();
+        agent.autonomy_tier = autonomy_tier;
+        agent.status = AgentStatus::Active;
+        agent.mint = ctx.accounts.mint.key();
+        agent.per_tx_limit = per_tx_limit;
+        agent.daily_limit = daily_limit;
+        agent.hitl_threshold = hitl_threshold;
+        agent.window_start = now;
+        agent.window_spent = 0;
+        agent.allowlist_enabled = allowlist_enabled;
+        agent.allowed_recipients = allowed_recipients.clone();
+        agent.pending_count = 0;
+        agent.index = ctx.accounts.profile.agent_count;
+        agent.created_at = now;
+        agent.updated_at = now;
+        agent.bump = ctx.bumps.agent;
+        agent.vault_bump = ctx.bumps.vault;
+
+        let profile = &mut ctx.accounts.profile;
+        profile.agent_count += 1;
+
+        emit!(AgentCreated {
+            agent: agent.key(),
+            owner: agent.owner,
+            agent_signer,
+            label,
+            autonomy_tier,
+            mint: agent.mint,
+            timestamp: now,
+        });
+        emit!(SpendPolicyUpdated {
+            agent: agent.key(),
+            per_tx_limit,
+            daily_limit,
+            hitl_threshold,
+            allowlist_enabled,
+            allowed_recipients,
+            timestamp: now,
+        });
+        Ok(())
+    }
+
+    /// Owner only. Replaces an agent's per-payment limit, daily limit, human
+    /// approval threshold and allowlist. The agent key has no way to call
+    /// this, so an agent can never raise its own limits.
+    pub fn update_spend_policy(
+        ctx: Context<OwnerAgent>,
+        per_tx_limit: u64,
+        daily_limit: u64,
+        hitl_threshold: u64,
+        allowlist_enabled: bool,
+        allowed_recipients: Vec<Pubkey>,
+    ) -> Result<()> {
+        validate_limits(
+            per_tx_limit,
+            daily_limit,
+            hitl_threshold,
+            allowlist_enabled,
+            allowed_recipients.len(),
+        )?;
+        let now = Clock::get()?.unix_timestamp;
+
+        let agent = &mut ctx.accounts.agent;
+        agent.per_tx_limit = per_tx_limit;
+        agent.daily_limit = daily_limit;
+        agent.hitl_threshold = hitl_threshold;
+        agent.allowlist_enabled = allowlist_enabled;
+        agent.allowed_recipients = allowed_recipients.clone();
+        agent.updated_at = now;
+
+        emit!(SpendPolicyUpdated {
+            agent: agent.key(),
+            per_tx_limit,
+            daily_limit,
+            hitl_threshold,
+            allowlist_enabled,
+            allowed_recipients,
+            timestamp: now,
+        });
+        Ok(())
+    }
+
+    /// Owner only. Switches an agent between active and paused while leaving
+    /// its funds and limits alone, which suits a temporary stop. It cannot set
+    /// the revoked state or bring back a revoked agent; use `revoke_agent` for
+    /// a permanent stop.
+    pub fn set_agent_status(ctx: Context<OwnerAgent>, status: AgentStatus) -> Result<()> {
+        require!(status != AgentStatus::Revoked, VeiledError::AgentAlreadyRevoked);
+        let agent = &mut ctx.accounts.agent;
+        require!(agent.status != AgentStatus::Revoked, VeiledError::AgentAlreadyRevoked);
+        agent.status = status;
+        emit!(AgentStatusChanged {
+            agent: agent.key(),
+            status,
+            timestamp: Clock::get()?.unix_timestamp,
+        });
+        Ok(())
+    }
+
+    /// Owner only. Points the agent at a new signing key. The vault, limits
+    /// and today's spend total stay as they are, so a leaked key can be
+    /// replaced without shutting the agent down for good.
+    pub fn rotate_agent_signer(ctx: Context<OwnerAgent>, new_signer: Pubkey) -> Result<()> {
+        require!(new_signer != Pubkey::default(), VeiledError::InvalidFeeConfig);
+        let agent = &mut ctx.accounts.agent;
+        require!(agent.status != AgentStatus::Revoked, VeiledError::AgentAlreadyRevoked);
+        require!(agent.agent_signer != new_signer, VeiledError::SameSigner);
+
+        let previous = agent.agent_signer;
+        agent.agent_signer = new_signer;
+        emit!(AgentSignerRotated {
+            agent: agent.key(),
+            previous_signer: previous,
+            new_signer,
+            timestamp: Clock::get()?.unix_timestamp,
+        });
+        Ok(())
+    }
+
+    /// Owner only. Shuts an agent down for good and sends whatever is left in
+    /// its vault to the owner's token account. There is no way back from this
+    /// state. It works even when the protocol is paused, since owners must be
+    /// able to get their money out during an incident.
+    pub fn revoke_agent(ctx: Context<RevokeAgent>) -> Result<()> {
+        let agent = &mut ctx.accounts.agent;
+        require!(agent.status != AgentStatus::Revoked, VeiledError::AgentAlreadyRevoked);
+        agent.status = AgentStatus::Revoked;
+
+        let remaining = ctx.accounts.vault.amount;
+        if remaining > 0 {
+            settle_from_vault(
+                &ctx.accounts.token_program,
+                &ctx.accounts.vault,
+                &ctx.accounts.mint,
+                &ctx.accounts.owner_token_account,
+                &None,
+                agent,
+                remaining,
+                None,
+            )?;
+        }
+
+        emit!(AgentStatusChanged {
+            agent: agent.key(),
+            status: AgentStatus::Revoked,
+            timestamp: Clock::get()?.unix_timestamp,
+        });
+        Ok(())
+    }
+
+    /// Tops up an agent's vault with its settlement mint. Any wallet may fund
+    /// any agent that has not been revoked, although in practice it is
+    /// usually the owner. Money only arrives when someone sends it.
+    pub fn fund_agent(ctx: Context<FundAgent>, amount: u64) -> Result<()> {
+        require!(amount > 0, VeiledError::InvalidSpendAmount);
+        require!(
+            ctx.accounts.agent.status != AgentStatus::Revoked,
+            VeiledError::AgentAlreadyRevoked
+        );
+
+        token_interface::transfer_checked(
+            CpiContext::new(
+                ctx.accounts.token_program.to_account_info(),
+                TransferChecked {
+                    from: ctx.accounts.funder_token_account.to_account_info(),
+                    mint: ctx.accounts.mint.to_account_info(),
+                    to: ctx.accounts.vault.to_account_info(),
+                    authority: ctx.accounts.funder.to_account_info(),
+                },
+            ),
+            amount,
+            ctx.accounts.mint.decimals,
+        )?;
+
+        emit!(AgentFunded {
+            agent: ctx.accounts.agent.key(),
+            funder: ctx.accounts.funder.key(),
+            amount,
+            timestamp: Clock::get()?.unix_timestamp,
+        });
+        Ok(())
+    }
+
+    /// Owner only. Pulls some of the vault balance back to the owner while the
+    /// agent carries on, which is useful when a vault holds more than it needs.
+    /// It ignores the protocol pause and the agent's status on purpose, and the
+    /// agent's signing key has no access to it.
+    pub fn withdraw_from_agent(ctx: Context<WithdrawFromAgent>, amount: u64) -> Result<()> {
+        require!(amount > 0, VeiledError::InvalidSpendAmount);
+        require!(
+            amount <= ctx.accounts.vault.amount,
+            VeiledError::InsufficientVaultBalance
+        );
+
+        let agent = &ctx.accounts.agent;
+        settle_from_vault(
+            &ctx.accounts.token_program,
+            &ctx.accounts.vault,
+            &ctx.accounts.mint,
+            &ctx.accounts.owner_token_account,
+            &None,
+            agent,
+            amount,
+            None,
+        )?;
+
+        emit!(AgentDefunded {
+            agent: agent.key(),
+            owner: agent.owner,
+            amount,
+            timestamp: Clock::get()?.unix_timestamp,
+        });
+        Ok(())
+    }
+
+    /// Signed by the agent key. Pays a recipient straight from the vault with
+    /// no human step. What is allowed depends on the autonomy tier: Supervised
+    /// agents are always refused, SemiAutonomous agents may pay amounts up to
+    /// and including the HITL threshold, and FullyAutonomous agents may pay
+    /// anything their limits permit. Every tier is still held to the
+    /// per-payment limit, the rolling daily limit and the allowlist. Any
+    /// protocol fee comes out of the vault as well as the payment itself.
+    pub fn pay_invoice(
+        ctx: Context<PayInvoice>,
+        amount: u64,
+        invoice_id: [u8; 32],
+    ) -> Result<()> {
+        require!(!ctx.accounts.config.paused, VeiledError::ProtocolPaused);
+        require!(amount > 0, VeiledError::InvalidSpendAmount);
+
+        let now = Clock::get()?.unix_timestamp;
+        let agent = &mut ctx.accounts.agent;
+        require!(agent.status == AgentStatus::Active, VeiledError::AgentNotActive);
+        require!(
+            agent.autonomy_tier != AutonomyTier::Supervised,
+            VeiledError::TierRequiresApproval
+        );
+        require!(amount <= agent.per_tx_limit, VeiledError::PerTransactionLimitExceeded);
+        if agent.autonomy_tier == AutonomyTier::SemiAutonomous {
+            require!(
+                amount <= agent.hitl_threshold,
+                VeiledError::AmountExceedsHitlThreshold
+            );
+        }
+        check_allowlist(agent, &ctx.accounts.recipient.key())?;
+
+        roll_window(agent, now);
+        let projected = agent
+            .window_spent
+            .checked_add(amount)
+            .ok_or(VeiledError::DailyLimitExceeded)?;
+        require!(projected <= agent.daily_limit, VeiledError::DailyLimitExceeded);
+
+        let quote = quote_fee(
+            &ctx.accounts.config,
+            &ctx.accounts.fee_config,
+            &agent.owner,
+            &ctx.accounts.owner_veiled_token_account,
+            &ctx.accounts.owner_stake_position,
+            amount,
+        )?;
+        let fee = quote.as_ref().map_or(0, |q| q.fee);
+        let total_debit = amount
+            .checked_add(fee)
+            .ok_or(VeiledError::AmountOverflow)?;
+        require!(
+            total_debit <= ctx.accounts.vault.amount,
+            VeiledError::InsufficientVaultBalance
+        );
+
+        agent.window_spent = projected;
+        agent.updated_at = now;
+
+        settle_from_vault(
+            &ctx.accounts.token_program,
+            &ctx.accounts.vault,
+            &ctx.accounts.mint,
+            &ctx.accounts.recipient_token_account,
+            &ctx.accounts.treasury_token_account,
+            agent,
+            amount,
+            quote,
+        )?;
+
+        emit!(AgentPaymentExecuted {
+            agent: agent.key(),
+            recipient: ctx.accounts.recipient.key(),
+            mint: agent.mint,
+            amount,
+            invoice_id,
+            window_spent: projected,
+            timestamp: now,
+        });
+        Ok(())
+    }
+
+    /// Signed by the agent key. Puts a payment in front of the owner instead of
+    /// paying it; nothing leaves the vault yet. Supervised agents send every
+    /// payment through here, and FullyAutonomous agents can choose to. A
+    /// SemiAutonomous agent may only queue amounts above its HITL threshold,
+    /// since smaller ones should go through `pay_invoice`. The allowlist and
+    /// per-payment limit are enforced up front to keep junk out of the queue.
+    /// The daily limit is left until the owner approves, because the total
+    /// may look different by then. The agent key pays the rent for the record.
+    pub fn queue_invoice(
+        ctx: Context<QueueInvoice>,
+        amount: u64,
+        invoice_id: [u8; 32],
+        memo_hash: [u8; 32],
+    ) -> Result<()> {
+        require!(!ctx.accounts.config.paused, VeiledError::ProtocolPaused);
+        require!(amount > 0, VeiledError::InvalidSpendAmount);
+
+        let now = Clock::get()?.unix_timestamp;
+        let agent = &mut ctx.accounts.agent;
+        require!(agent.status == AgentStatus::Active, VeiledError::AgentNotActive);
+        require!(amount <= agent.per_tx_limit, VeiledError::PerTransactionLimitExceeded);
+        if agent.autonomy_tier == AutonomyTier::SemiAutonomous {
+            require!(
+                amount > agent.hitl_threshold,
+                VeiledError::AmountWithinHitlThreshold
+            );
+        }
+        check_allowlist(agent, &ctx.accounts.recipient.key())?;
+
+        let pending = &mut ctx.accounts.pending;
+        pending.agent = agent.key();
+        pending.owner = agent.owner;
+        pending.recipient = ctx.accounts.recipient.key();
+        pending.mint = agent.mint;
+        pending.amount = amount;
+        pending.invoice_id = invoice_id;
+        pending.memo_hash = memo_hash;
+        pending.index = agent.pending_count;
+        pending.created_at = now;
+        pending.bump = ctx.bumps.pending;
+
+        agent.pending_count += 1;
+
+        emit!(ApprovalRequired {
+            agent: agent.key(),
+            pending_index: pending.index,
+            recipient: pending.recipient,
+            mint: pending.mint,
+            amount,
+            invoice_id,
+            timestamp: now,
+        });
+        Ok(())
+    }
+
+    /// Owner only. Pays out a queued payment from the vault and closes the
+    /// queue record, with its rent going to the owner. Status, allowlist,
+    /// per-payment limit and daily limit are all checked again using today's
+    /// values, because any of them could have changed since it was queued.
+    pub fn approve_pending(ctx: Context<ApprovePending>) -> Result<()> {
+        require!(!ctx.accounts.config.paused, VeiledError::ProtocolPaused);
+
+        let now = Clock::get()?.unix_timestamp;
+        let amount = ctx.accounts.pending.amount;
+        let invoice_id = ctx.accounts.pending.invoice_id;
+        let pending_index = ctx.accounts.pending.index;
+        let recipient = ctx.accounts.pending.recipient;
+
+        let agent = &mut ctx.accounts.agent;
+        require!(agent.status == AgentStatus::Active, VeiledError::AgentNotActive);
+        check_allowlist(agent, &recipient)?;
+        require!(amount <= agent.per_tx_limit, VeiledError::PerTransactionLimitExceeded);
+
+        roll_window(agent, now);
+        let projected = agent
+            .window_spent
+            .checked_add(amount)
+            .ok_or(VeiledError::DailyLimitExceeded)?;
+        require!(projected <= agent.daily_limit, VeiledError::DailyLimitExceeded);
+
+        let quote = quote_fee(
+            &ctx.accounts.config,
+            &ctx.accounts.fee_config,
+            &agent.owner,
+            &ctx.accounts.owner_veiled_token_account,
+            &ctx.accounts.owner_stake_position,
+            amount,
+        )?;
+        let fee = quote.as_ref().map_or(0, |q| q.fee);
+        let total_debit = amount
+            .checked_add(fee)
+            .ok_or(VeiledError::AmountOverflow)?;
+        require!(
+            total_debit <= ctx.accounts.vault.amount,
+            VeiledError::InsufficientVaultBalance
+        );
+
+        agent.window_spent = projected;
+        agent.updated_at = now;
+
+        settle_from_vault(
+            &ctx.accounts.token_program,
+            &ctx.accounts.vault,
+            &ctx.accounts.mint,
+            &ctx.accounts.recipient_token_account,
+            &ctx.accounts.treasury_token_account,
+            agent,
+            amount,
+            quote,
+        )?;
+
+        emit!(AgentPaymentExecuted {
+            agent: agent.key(),
+            recipient,
+            mint: agent.mint,
+            amount,
+            invoice_id,
+            window_spent: projected,
+            timestamp: now,
+        });
+        emit!(PendingPaymentApproved {
+            agent: agent.key(),
+            pending_index,
+            recipient,
+            amount,
+            timestamp: now,
+        });
+        Ok(())
+    }
+
+    /// Owner only. Turns down a queued payment and closes its record, sending
+    /// the rent to the owner. Queuing never moved any tokens, so there is no
+    /// refund to make.
+    pub fn reject_pending(ctx: Context<RejectPending>) -> Result<()> {
+        emit!(PendingPaymentRejected {
+            agent: ctx.accounts.agent.key(),
+            pending_index: ctx.accounts.pending.index,
+            timestamp: Clock::get()?.unix_timestamp,
+        });
+        Ok(())
+    }
+}
+
+// ---- Helpers shared by the instructions above ----
+
+/// Checks a proposed set of agent limits before it is stored.
+fn validate_limits(
+    per_tx_limit: u64,
+    daily_limit: u64,
+    hitl_threshold: u64,
+    allowlist_enabled: bool,
+    allowlist_len: usize,
+) -> Result<()> {
+    require!(hitl_threshold > 0, VeiledError::InvalidHitlThreshold);
+    require!(per_tx_limit > 0 && daily_limit > 0, VeiledError::InvalidSpendAmount);
+    require!(per_tx_limit <= daily_limit, VeiledError::PerTxLimitExceedsDailyLimit);
+    require!(
+        allowlist_len <= MAX_ALLOWED_RECIPIENTS,
+        VeiledError::TooManyAllowedRecipients
+    );
+    // An allowlist that is switched on but empty blocks every payment, which
+    // is easy to set by accident and hard to spot. Pausing the agent is the
+    // explicit way to stop it spending.
+    require!(
+        !allowlist_enabled || allowlist_len > 0,
+        VeiledError::EmptyAllowlist
+    );
+    Ok(())
+}
+
+/// Passes when the allowlist is off or contains `recipient`.
+fn check_allowlist(agent: &Agent, recipient: &Pubkey) -> Result<()> {
+    if !agent.allowlist_enabled {
+        return Ok(());
+    }
+    require!(
+        agent.allowed_recipients.contains(recipient),
+        VeiledError::RecipientNotAllowed
+    );
+    Ok(())
+}
+
+/// Starts a new daily window, with the spent total back at zero, once
+/// `WINDOW_SECONDS` have gone by since the current one began. Doing this
+/// lazily inside each spend means nobody has to send a reset transaction.
+fn roll_window(agent: &mut Agent, now: i64) {
+    if now - agent.window_start >= WINDOW_SECONDS {
+        agent.window_start = now;
+        agent.window_spent = 0;
+    }
+}
+
+/// The single place where tokens leave an agent vault. The agent PDA signs
+/// for the main transfer and, if the quote carries a nonzero fee, a second
+/// transfer to the treasury token account. Keeping both in one function means
+/// payments, approvals, withdrawals and revocations all use identical signer
+/// seeds and fee handling.
+#[allow(clippy::too_many_arguments)]
+fn settle_from_vault<'info>(
+    token_program: &Interface<'info, TokenInterface>,
+    vault: &InterfaceAccount<'info, TokenAccount>,
+    mint: &InterfaceAccount<'info, Mint>,
+    recipient_token_account: &InterfaceAccount<'info, TokenAccount>,
+    treasury_token_account: &Option<InterfaceAccount<'info, TokenAccount>>,
+    agent: &Account<'info, Agent>,
+    amount: u64,
+    quote: Option<FeeQuote>,
+) -> Result<()> {
+    let seeds: &[&[u8]] = &[
+        AGENT_SEED,
+        agent.owner.as_ref(),
+        &agent.index.to_le_bytes(),
+        &[agent.bump],
+    ];
+    token_interface::transfer_checked(
+        CpiContext::new_with_signer(
+            token_program.to_account_info(),
+            TransferChecked {
+                from: vault.to_account_info(),
+                mint: mint.to_account_info(),
+                to: recipient_token_account.to_account_info(),
+                authority: agent.to_account_info(),
+            },
+            &[seeds],
+        ),
+        amount,
+        mint.decimals,
+    )?;
+
+    if let Some(quote) = quote {
+        if quote.fee > 0 {
+            let treasury_ata = treasury_token_account
+                .as_ref()
+                .ok_or(error!(VeiledError::MissingFeeAccounts))?;
+            require_keys_eq!(
+                treasury_ata.owner,
+                quote.treasury,
+                VeiledError::InvalidFeeAccount
+            );
+            token_interface::transfer_checked(
+                CpiContext::new_with_signer(
+                    token_program.to_account_info(),
+                    TransferChecked {
+                        from: vault.to_account_info(),
+                        mint: mint.to_account_info(),
+                        to: treasury_ata.to_account_info(),
+                        authority: agent.to_account_info(),
+                    },
+                    &[seeds],
+                ),
+                quote.fee,
+                mint.decimals,
+            )?;
+            emit!(ProtocolFeeCharged {
+                payer: agent.owner,
+                treasury: quote.treasury,
+                fee: quote.fee,
+                timestamp: Clock::get()?.unix_timestamp,
+            });
+        }
+    }
+    Ok(())
 }
 
 // ---- Account lists: admin and config ----
@@ -665,4 +1259,270 @@ pub struct SetKycTier<'info> {
         bump = profile.bump
     )]
     pub profile: Account<'info, Profile>,
+}
+
+// ---- Account lists: agents ----
+
+#[derive(Accounts)]
+pub struct CreateAgent<'info> {
+    #[account(mut)]
+    pub owner: Signer<'info>,
+    #[account(
+        mut,
+        seeds = [PROFILE_SEED, owner.key().as_ref()],
+        bump = profile.bump
+    )]
+    pub profile: Account<'info, Profile>,
+    #[account(
+        init,
+        payer = owner,
+        space = 8 + Agent::INIT_SPACE,
+        seeds = [AGENT_SEED, owner.key().as_ref(), &profile.agent_count.to_le_bytes()],
+        bump
+    )]
+    pub agent: Account<'info, Agent>,
+    /// The only mint this agent can spend, normally USDG.
+    pub mint: InterfaceAccount<'info, Mint>,
+    /// Token account owned by the agent PDA. Funds can only leave through
+    /// this program's checks, so a stolen agent key cannot spend beyond the
+    /// agent's limits.
+    #[account(
+        init,
+        payer = owner,
+        seeds = [VAULT_SEED, agent.key().as_ref()],
+        bump,
+        token::mint = mint,
+        token::authority = agent,
+        token::token_program = token_program
+    )]
+    pub vault: InterfaceAccount<'info, TokenAccount>,
+    pub token_program: Interface<'info, TokenInterface>,
+    pub system_program: Program<'info, System>,
+}
+
+#[derive(Accounts)]
+pub struct OwnerAgent<'info> {
+    pub owner: Signer<'info>,
+    #[account(
+        mut,
+        seeds = [AGENT_SEED, owner.key().as_ref(), &agent.index.to_le_bytes()],
+        bump = agent.bump,
+        constraint = agent.owner == owner.key() @ VeiledError::UnauthorizedAgentOwner
+    )]
+    pub agent: Account<'info, Agent>,
+}
+
+#[derive(Accounts)]
+pub struct RevokeAgent<'info> {
+    pub owner: Signer<'info>,
+    #[account(
+        mut,
+        seeds = [AGENT_SEED, owner.key().as_ref(), &agent.index.to_le_bytes()],
+        bump = agent.bump,
+        constraint = agent.owner == owner.key() @ VeiledError::UnauthorizedAgentOwner
+    )]
+    pub agent: Account<'info, Agent>,
+    #[account(
+        mut,
+        seeds = [VAULT_SEED, agent.key().as_ref()],
+        bump = agent.vault_bump
+    )]
+    pub vault: InterfaceAccount<'info, TokenAccount>,
+    #[account(constraint = mint.key() == agent.mint @ VeiledError::InvalidMint)]
+    pub mint: InterfaceAccount<'info, Mint>,
+    #[account(
+        mut,
+        constraint = owner_token_account.owner == owner.key() @ VeiledError::Unauthorized,
+        constraint = owner_token_account.mint == agent.mint @ VeiledError::InvalidMint
+    )]
+    pub owner_token_account: InterfaceAccount<'info, TokenAccount>,
+    pub token_program: Interface<'info, TokenInterface>,
+}
+
+#[derive(Accounts)]
+pub struct FundAgent<'info> {
+    pub funder: Signer<'info>,
+    #[account(
+        seeds = [AGENT_SEED, agent.owner.as_ref(), &agent.index.to_le_bytes()],
+        bump = agent.bump
+    )]
+    pub agent: Account<'info, Agent>,
+    #[account(
+        mut,
+        seeds = [VAULT_SEED, agent.key().as_ref()],
+        bump = agent.vault_bump
+    )]
+    pub vault: InterfaceAccount<'info, TokenAccount>,
+    #[account(constraint = mint.key() == agent.mint @ VeiledError::InvalidMint)]
+    pub mint: InterfaceAccount<'info, Mint>,
+    #[account(
+        mut,
+        constraint = funder_token_account.owner == funder.key() @ VeiledError::Unauthorized,
+        constraint = funder_token_account.mint == agent.mint @ VeiledError::InvalidMint
+    )]
+    pub funder_token_account: InterfaceAccount<'info, TokenAccount>,
+    pub token_program: Interface<'info, TokenInterface>,
+}
+
+#[derive(Accounts)]
+pub struct WithdrawFromAgent<'info> {
+    pub owner: Signer<'info>,
+    #[account(
+        seeds = [AGENT_SEED, owner.key().as_ref(), &agent.index.to_le_bytes()],
+        bump = agent.bump,
+        constraint = agent.owner == owner.key() @ VeiledError::UnauthorizedAgentOwner
+    )]
+    pub agent: Account<'info, Agent>,
+    #[account(
+        mut,
+        seeds = [VAULT_SEED, agent.key().as_ref()],
+        bump = agent.vault_bump
+    )]
+    pub vault: InterfaceAccount<'info, TokenAccount>,
+    #[account(constraint = mint.key() == agent.mint @ VeiledError::InvalidMint)]
+    pub mint: InterfaceAccount<'info, Mint>,
+    #[account(
+        mut,
+        constraint = owner_token_account.owner == owner.key() @ VeiledError::Unauthorized,
+        constraint = owner_token_account.mint == agent.mint @ VeiledError::InvalidMint
+    )]
+    pub owner_token_account: InterfaceAccount<'info, TokenAccount>,
+    pub token_program: Interface<'info, TokenInterface>,
+}
+
+#[derive(Accounts)]
+pub struct PayInvoice<'info> {
+    pub agent_signer: Signer<'info>,
+    #[account(seeds = [CONFIG_SEED], bump = config.bump)]
+    pub config: Account<'info, ProtocolConfig>,
+    #[account(
+        mut,
+        seeds = [AGENT_SEED, agent.owner.as_ref(), &agent.index.to_le_bytes()],
+        bump = agent.bump,
+        constraint = agent.agent_signer == agent_signer.key() @ VeiledError::UnauthorizedAgentSigner
+    )]
+    pub agent: Account<'info, Agent>,
+    #[account(
+        mut,
+        seeds = [VAULT_SEED, agent.key().as_ref()],
+        bump = agent.vault_bump
+    )]
+    pub vault: InterfaceAccount<'info, TokenAccount>,
+    #[account(constraint = mint.key() == agent.mint @ VeiledError::InvalidMint)]
+    pub mint: InterfaceAccount<'info, Mint>,
+    /// CHECK: Wallet being paid. The handler tests it against the allowlist,
+    /// and `recipient_token_account` must belong to it.
+    pub recipient: UncheckedAccount<'info>,
+    #[account(
+        mut,
+        constraint = recipient_token_account.owner == recipient.key() @ VeiledError::Unauthorized,
+        constraint = recipient_token_account.mint == agent.mint @ VeiledError::InvalidMint
+    )]
+    pub recipient_token_account: InterfaceAccount<'info, TokenAccount>,
+    #[account(seeds = [FEES_SEED], bump = fee_config.bump)]
+    pub fee_config: Option<Account<'info, FeeConfig>>,
+    pub owner_veiled_token_account: Option<InterfaceAccount<'info, TokenAccount>>,
+    #[account(
+        seeds = [STAKE_SEED, agent.owner.as_ref()],
+        bump = owner_stake_position.bump
+    )]
+    pub owner_stake_position: Option<Account<'info, StakePosition>>,
+    #[account(mut)]
+    pub treasury_token_account: Option<InterfaceAccount<'info, TokenAccount>>,
+    pub token_program: Interface<'info, TokenInterface>,
+}
+
+#[derive(Accounts)]
+pub struct QueueInvoice<'info> {
+    #[account(mut)]
+    pub agent_signer: Signer<'info>,
+    #[account(seeds = [CONFIG_SEED], bump = config.bump)]
+    pub config: Account<'info, ProtocolConfig>,
+    #[account(
+        mut,
+        seeds = [AGENT_SEED, agent.owner.as_ref(), &agent.index.to_le_bytes()],
+        bump = agent.bump,
+        constraint = agent.agent_signer == agent_signer.key() @ VeiledError::UnauthorizedAgentSigner
+    )]
+    pub agent: Account<'info, Agent>,
+    /// CHECK: Wallet that would be paid. Tested against the allowlist and
+    /// saved on the queue record so the owner can see it before approving.
+    pub recipient: UncheckedAccount<'info>,
+    #[account(
+        init,
+        payer = agent_signer,
+        space = 8 + PendingApproval::INIT_SPACE,
+        seeds = [PENDING_SEED, agent.key().as_ref(), &agent.pending_count.to_le_bytes()],
+        bump
+    )]
+    pub pending: Account<'info, PendingApproval>,
+    pub system_program: Program<'info, System>,
+}
+
+#[derive(Accounts)]
+pub struct ApprovePending<'info> {
+    #[account(mut)]
+    pub owner: Signer<'info>,
+    #[account(seeds = [CONFIG_SEED], bump = config.bump)]
+    pub config: Box<Account<'info, ProtocolConfig>>,
+    #[account(
+        mut,
+        seeds = [AGENT_SEED, owner.key().as_ref(), &agent.index.to_le_bytes()],
+        bump = agent.bump,
+        constraint = agent.owner == owner.key() @ VeiledError::UnauthorizedAgentOwner
+    )]
+    pub agent: Box<Account<'info, Agent>>,
+    #[account(
+        mut,
+        close = owner,
+        seeds = [PENDING_SEED, agent.key().as_ref(), &pending.index.to_le_bytes()],
+        bump = pending.bump,
+        constraint = pending.agent == agent.key() @ VeiledError::Unauthorized
+    )]
+    pub pending: Box<Account<'info, PendingApproval>>,
+    #[account(
+        mut,
+        seeds = [VAULT_SEED, agent.key().as_ref()],
+        bump = agent.vault_bump
+    )]
+    pub vault: Box<InterfaceAccount<'info, TokenAccount>>,
+    #[account(constraint = mint.key() == agent.mint @ VeiledError::InvalidMint)]
+    pub mint: Box<InterfaceAccount<'info, Mint>>,
+    #[account(
+        mut,
+        constraint = recipient_token_account.owner == pending.recipient @ VeiledError::Unauthorized,
+        constraint = recipient_token_account.mint == agent.mint @ VeiledError::InvalidMint
+    )]
+    pub recipient_token_account: Box<InterfaceAccount<'info, TokenAccount>>,
+    #[account(seeds = [FEES_SEED], bump = fee_config.bump)]
+    pub fee_config: Option<Account<'info, FeeConfig>>,
+    pub owner_veiled_token_account: Option<InterfaceAccount<'info, TokenAccount>>,
+    #[account(
+        seeds = [STAKE_SEED, agent.owner.as_ref()],
+        bump = owner_stake_position.bump
+    )]
+    pub owner_stake_position: Option<Account<'info, StakePosition>>,
+    #[account(mut)]
+    pub treasury_token_account: Option<InterfaceAccount<'info, TokenAccount>>,
+    pub token_program: Interface<'info, TokenInterface>,
+}
+
+#[derive(Accounts)]
+pub struct RejectPending<'info> {
+    #[account(mut)]
+    pub owner: Signer<'info>,
+    #[account(
+        seeds = [AGENT_SEED, owner.key().as_ref(), &agent.index.to_le_bytes()],
+        bump = agent.bump,
+        constraint = agent.owner == owner.key() @ VeiledError::UnauthorizedAgentOwner
+    )]
+    pub agent: Account<'info, Agent>,
+    #[account(
+        mut,
+        close = owner,
+        seeds = [PENDING_SEED, agent.key().as_ref(), &pending.index.to_le_bytes()],
+        bump = pending.bump,
+        constraint = pending.agent == agent.key() @ VeiledError::Unauthorized
+    )]
+    pub pending: Account<'info, PendingApproval>,
 }
