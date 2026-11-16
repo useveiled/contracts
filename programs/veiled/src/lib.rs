@@ -28,6 +28,8 @@ use logs::*;
 use pricing::{quote_fee, FeeQuote};
 use model::*;
 
+declare_id!("BgJQoxfRfpQYhJLFxnq7f8GcxPoAce47MGPnq1qJiV7V");
+
 #[program]
 pub mod veiled {
     use super::*;
@@ -914,6 +916,230 @@ pub mod veiled {
         });
         Ok(())
     }
+
+    // ---- Request-to-pay ----
+
+    /// Opens a request-to-pay, the record behind a shareable Veiled link or QR
+    /// code, with an expiry that must be in the future. A public request
+    /// stores a nonzero `amount`. A confidential one stores only
+    /// `amount_commitment`, a keccak256 hash of the amount and a blinding
+    /// value; any `amount` passed with it is ignored and saved as zero. The
+    /// payer gets the real amount and blinding value through another channel,
+    /// for example the request's encrypted memo.
+    pub fn create_request(
+        ctx: Context<CreateRequest>,
+        is_confidential: bool,
+        amount: u64,
+        amount_commitment: [u8; 32],
+        memo_hash: [u8; 32],
+        expires_at: i64,
+    ) -> Result<()> {
+        let now = Clock::get()?.unix_timestamp;
+        require!(expires_at > now, VeiledError::InvalidExpiry);
+        require!(is_confidential || amount > 0, VeiledError::InvalidSpendAmount);
+
+        let request = &mut ctx.accounts.request;
+        request.requester = ctx.accounts.requester.key();
+        request.receiver = ctx.accounts.receiver.key();
+        request.mint = ctx.accounts.mint.key();
+        request.is_confidential = is_confidential;
+        request.amount = if is_confidential { 0 } else { amount };
+        request.amount_commitment = if is_confidential {
+            amount_commitment
+        } else {
+            [0u8; 32]
+        };
+        request.memo_hash = memo_hash;
+        request.status = RequestStatus::Open;
+        request.index = ctx.accounts.profile.request_count;
+        request.created_at = now;
+        request.expires_at = expires_at;
+        request.bump = ctx.bumps.request;
+
+        let profile = &mut ctx.accounts.profile;
+        profile.request_count += 1;
+
+        emit!(PaymentRequestCreated {
+            request: request.key(),
+            requester: request.requester,
+            mint: request.mint,
+            is_confidential,
+            amount: request.amount,
+            expires_at,
+            timestamp: now,
+        });
+        Ok(())
+    }
+
+    /// Pays an open, unexpired request and marks it fulfilled. For a public
+    /// request, `amount` has to equal the stored amount. For a confidential
+    /// request, the program hashes the little-endian `amount` together with
+    /// `blinding` using keccak256 and compares the result with the stored
+    /// commitment, so a wrong amount is caught without the right one ever
+    /// being written on-chain. Any protocol fee is taken from the payer as an
+    /// extra transfer, and the receiver gets the full amount.
+    pub fn fulfill_request(
+        ctx: Context<FulfillRequest>,
+        amount: u64,
+        blinding: [u8; 32],
+    ) -> Result<()> {
+        require!(!ctx.accounts.config.paused, VeiledError::ProtocolPaused);
+        // Without this, someone could commit to zero and then mark a request
+        // as paid while sending nothing.
+        require!(amount > 0, VeiledError::InvalidSpendAmount);
+
+        let now = Clock::get()?.unix_timestamp;
+        let request = &mut ctx.accounts.request;
+        require!(request.status == RequestStatus::Open, VeiledError::RequestNotOpen);
+        require!(now < request.expires_at, VeiledError::RequestExpired);
+
+        if request.is_confidential {
+            let digest = keccak::hashv(&[&amount.to_le_bytes(), &blinding]).to_bytes();
+            require!(
+                digest == request.amount_commitment,
+                VeiledError::RequestCommitmentMismatch
+            );
+        } else {
+            require!(amount == request.amount, VeiledError::RequestAmountMismatch);
+        }
+
+        request.status = RequestStatus::Fulfilled;
+
+        let quote = quote_fee(
+            &ctx.accounts.config,
+            &ctx.accounts.fee_config,
+            &ctx.accounts.payer.key(),
+            &ctx.accounts.payer_veiled_token_account,
+            &ctx.accounts.payer_stake_position,
+            amount,
+        )?;
+
+        token_interface::transfer_checked(
+            CpiContext::new(
+                ctx.accounts.token_program.to_account_info(),
+                TransferChecked {
+                    from: ctx.accounts.payer_token_account.to_account_info(),
+                    mint: ctx.accounts.mint.to_account_info(),
+                    to: ctx.accounts.receiver_token_account.to_account_info(),
+                    authority: ctx.accounts.payer.to_account_info(),
+                },
+            ),
+            amount,
+            ctx.accounts.mint.decimals,
+        )?;
+
+        if let Some(quote) = quote {
+            if quote.fee > 0 {
+                let treasury_ata = ctx
+                    .accounts
+                    .treasury_token_account
+                    .as_ref()
+                    .ok_or(error!(VeiledError::MissingFeeAccounts))?;
+                require_keys_eq!(
+                    treasury_ata.owner,
+                    quote.treasury,
+                    VeiledError::InvalidFeeAccount
+                );
+                token_interface::transfer_checked(
+                    CpiContext::new(
+                        ctx.accounts.token_program.to_account_info(),
+                        TransferChecked {
+                            from: ctx.accounts.payer_token_account.to_account_info(),
+                            mint: ctx.accounts.mint.to_account_info(),
+                            to: treasury_ata.to_account_info(),
+                            authority: ctx.accounts.payer.to_account_info(),
+                        },
+                    ),
+                    quote.fee,
+                    ctx.accounts.mint.decimals,
+                )?;
+                emit!(ProtocolFeeCharged {
+                    payer: ctx.accounts.payer.key(),
+                    treasury: quote.treasury,
+                    fee: quote.fee,
+                    timestamp: now,
+                });
+            }
+        }
+
+        emit!(PaymentRequestFulfilled {
+            request: request.key(),
+            payer: ctx.accounts.payer.key(),
+            amount,
+            timestamp: now,
+        });
+        Ok(())
+    }
+
+    /// Requester only. Marks an open request as cancelled so it can no longer
+    /// be paid.
+    pub fn cancel_request(ctx: Context<CancelRequest>) -> Result<()> {
+        let request = &mut ctx.accounts.request;
+        require!(request.status == RequestStatus::Open, VeiledError::RequestNotOpen);
+        request.status = RequestStatus::Cancelled;
+        emit!(PaymentRequestCancelled {
+            request: request.key(),
+            timestamp: Clock::get()?.unix_timestamp,
+        });
+        Ok(())
+    }
+
+    /// Requester only. Deletes a request account and refunds its rent. Paid or
+    /// cancelled requests can be closed whenever the requester likes. An open
+    /// request has to reach its expiry first, so nobody paying from a valid
+    /// link finds the record gone halfway through.
+    pub fn close_request(ctx: Context<CloseRequest>) -> Result<()> {
+        let request = &ctx.accounts.request;
+        let now = Clock::get()?.unix_timestamp;
+        require!(
+            request.status != RequestStatus::Open || now >= request.expires_at,
+            VeiledError::RequestStillOpen
+        );
+        emit!(PaymentRequestClosed {
+            request: request.key(),
+            timestamp: now,
+        });
+        Ok(())
+    }
+
+    // ---- Disclosure receipts ----
+
+    /// Writes a receipt saying the signer revealed details of a confidential
+    /// transfer to a particular viewer, identified only by `viewer_hash`. The
+    /// proof is never stored here. The receipt holds the transaction
+    /// reference, a commitment to what was disclosed and the time it was filed.
+    pub fn file_disclosure(
+        ctx: Context<FileDisclosure>,
+        tx_reference: String,
+        viewer_hash: [u8; 32],
+        disclosure_commitment: [u8; 32],
+    ) -> Result<()> {
+        require!(
+            !tx_reference.is_empty() && tx_reference.len() <= MAX_TX_REFERENCE_LEN,
+            VeiledError::InvalidTxReferenceLength
+        );
+        let now = Clock::get()?.unix_timestamp;
+
+        let receipt = &mut ctx.accounts.receipt;
+        receipt.profile = ctx.accounts.owner.key();
+        receipt.tx_reference = tx_reference.clone();
+        receipt.viewer_hash = viewer_hash;
+        receipt.disclosure_commitment = disclosure_commitment;
+        receipt.index = ctx.accounts.profile.disclosure_count;
+        receipt.filed_at = now;
+        receipt.bump = ctx.bumps.receipt;
+
+        let profile = &mut ctx.accounts.profile;
+        profile.disclosure_count += 1;
+
+        emit!(DisclosureFiled {
+            receipt: receipt.key(),
+            profile: receipt.profile,
+            tx_reference,
+            timestamp: now,
+        });
+        Ok(())
+    }
 }
 
 // ---- Helpers shared by the instructions above ----
@@ -1525,4 +1751,118 @@ pub struct RejectPending<'info> {
         constraint = pending.agent == agent.key() @ VeiledError::Unauthorized
     )]
     pub pending: Account<'info, PendingApproval>,
+}
+
+// ---- Account lists: request-to-pay ----
+
+#[derive(Accounts)]
+pub struct CreateRequest<'info> {
+    #[account(mut)]
+    pub requester: Signer<'info>,
+    #[account(
+        mut,
+        seeds = [PROFILE_SEED, requester.key().as_ref()],
+        bump = profile.bump
+    )]
+    pub profile: Account<'info, Profile>,
+    #[account(
+        init,
+        payer = requester,
+        space = 8 + PaymentRequest::INIT_SPACE,
+        seeds = [REQUEST_SEED, requester.key().as_ref(), &profile.request_count.to_le_bytes()],
+        bump
+    )]
+    pub request: Account<'info, PaymentRequest>,
+    /// CHECK: Wallet that gets paid when the request is fulfilled. It can
+    /// differ from the requester, for example a company treasury.
+    pub receiver: UncheckedAccount<'info>,
+    pub mint: InterfaceAccount<'info, Mint>,
+    pub system_program: Program<'info, System>,
+}
+
+#[derive(Accounts)]
+pub struct FulfillRequest<'info> {
+    pub payer: Signer<'info>,
+    #[account(seeds = [CONFIG_SEED], bump = config.bump)]
+    pub config: Account<'info, ProtocolConfig>,
+    #[account(
+        mut,
+        seeds = [REQUEST_SEED, request.requester.as_ref(), &request.index.to_le_bytes()],
+        bump = request.bump
+    )]
+    pub request: Account<'info, PaymentRequest>,
+    #[account(constraint = mint.key() == request.mint @ VeiledError::InvalidMint)]
+    pub mint: InterfaceAccount<'info, Mint>,
+    #[account(
+        mut,
+        constraint = payer_token_account.owner == payer.key() @ VeiledError::Unauthorized,
+        constraint = payer_token_account.mint == request.mint @ VeiledError::InvalidMint
+    )]
+    pub payer_token_account: InterfaceAccount<'info, TokenAccount>,
+    #[account(
+        mut,
+        constraint = receiver_token_account.owner == request.receiver @ VeiledError::Unauthorized,
+        constraint = receiver_token_account.mint == request.mint @ VeiledError::InvalidMint
+    )]
+    pub receiver_token_account: InterfaceAccount<'info, TokenAccount>,
+    #[account(seeds = [FEES_SEED], bump = fee_config.bump)]
+    pub fee_config: Option<Account<'info, FeeConfig>>,
+    pub payer_veiled_token_account: Option<InterfaceAccount<'info, TokenAccount>>,
+    #[account(
+        seeds = [STAKE_SEED, payer.key().as_ref()],
+        bump = payer_stake_position.bump
+    )]
+    pub payer_stake_position: Option<Account<'info, StakePosition>>,
+    #[account(mut)]
+    pub treasury_token_account: Option<InterfaceAccount<'info, TokenAccount>>,
+    pub token_program: Interface<'info, TokenInterface>,
+}
+
+#[derive(Accounts)]
+pub struct CancelRequest<'info> {
+    pub requester: Signer<'info>,
+    #[account(
+        mut,
+        seeds = [REQUEST_SEED, requester.key().as_ref(), &request.index.to_le_bytes()],
+        bump = request.bump,
+        constraint = request.requester == requester.key() @ VeiledError::Unauthorized
+    )]
+    pub request: Account<'info, PaymentRequest>,
+}
+
+#[derive(Accounts)]
+pub struct CloseRequest<'info> {
+    #[account(mut)]
+    pub requester: Signer<'info>,
+    #[account(
+        mut,
+        close = requester,
+        seeds = [REQUEST_SEED, requester.key().as_ref(), &request.index.to_le_bytes()],
+        bump = request.bump,
+        constraint = request.requester == requester.key() @ VeiledError::Unauthorized
+    )]
+    pub request: Account<'info, PaymentRequest>,
+}
+
+// ---- Account lists: disclosure receipts ----
+
+#[derive(Accounts)]
+pub struct FileDisclosure<'info> {
+    #[account(mut)]
+    pub owner: Signer<'info>,
+    #[account(
+        mut,
+        seeds = [PROFILE_SEED, owner.key().as_ref()],
+        bump = profile.bump
+    )]
+    pub profile: Account<'info, Profile>,
+    #[account(
+        init,
+        payer = owner,
+        space = 8 + DisclosureReceipt::INIT_SPACE,
+        seeds = [DISCLOSURE_SEED, owner.key().as_ref(), &profile.disclosure_count.to_le_bytes()],
+        bump
+    )]
+    pub receipt: Account<'info, DisclosureReceipt>,
+    pub system_program: Program<'info, System>,
 }
