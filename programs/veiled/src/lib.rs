@@ -569,11 +569,13 @@ pub mod veiled {
         require!(status != AgentStatus::Revoked, VeiledError::AgentAlreadyRevoked);
         let agent = &mut ctx.accounts.agent;
         require!(agent.status != AgentStatus::Revoked, VeiledError::AgentAlreadyRevoked);
+        let now = Clock::get()?.unix_timestamp;
         agent.status = status;
+        agent.updated_at = now;
         emit!(AgentStatusChanged {
             agent: agent.key(),
             status,
-            timestamp: Clock::get()?.unix_timestamp,
+            timestamp: now,
         });
         Ok(())
     }
@@ -587,13 +589,15 @@ pub mod veiled {
         require!(agent.status != AgentStatus::Revoked, VeiledError::AgentAlreadyRevoked);
         require!(agent.agent_signer != new_signer, VeiledError::SameSigner);
 
+        let now = Clock::get()?.unix_timestamp;
         let previous = agent.agent_signer;
         agent.agent_signer = new_signer;
+        agent.updated_at = now;
         emit!(AgentSignerRotated {
             agent: agent.key(),
             previous_signer: previous,
             new_signer,
-            timestamp: Clock::get()?.unix_timestamp,
+            timestamp: now,
         });
         Ok(())
     }
@@ -605,7 +609,9 @@ pub mod veiled {
     pub fn revoke_agent(ctx: Context<RevokeAgent>) -> Result<()> {
         let agent = &mut ctx.accounts.agent;
         require!(agent.status != AgentStatus::Revoked, VeiledError::AgentAlreadyRevoked);
+        let now = Clock::get()?.unix_timestamp;
         agent.status = AgentStatus::Revoked;
+        agent.updated_at = now;
 
         let remaining = ctx.accounts.vault.amount;
         if remaining > 0 {
@@ -624,7 +630,7 @@ pub mod veiled {
         emit!(AgentStatusChanged {
             agent: agent.key(),
             status: AgentStatus::Revoked,
-            timestamp: Clock::get()?.unix_timestamp,
+            timestamp: now,
         });
         Ok(())
     }
