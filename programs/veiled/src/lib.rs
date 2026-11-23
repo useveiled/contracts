@@ -935,6 +935,13 @@ pub mod veiled {
         let now = Clock::get()?.unix_timestamp;
         require!(expires_at > now, VeiledError::InvalidExpiry);
         require!(is_confidential || amount > 0, VeiledError::InvalidSpendAmount);
+        // An all-zero commitment is what plain requests store, and nobody can
+        // find an amount and blinding value that hash to it, so a confidential
+        // request created with one could never be paid.
+        require!(
+            !is_confidential || amount_commitment != [0u8; 32],
+            VeiledError::MissingAmountCommitment
+        );
 
         let request = &mut ctx.accounts.request;
         request.requester = ctx.accounts.requester.key();

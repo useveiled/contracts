@@ -81,4 +81,6 @@ pub enum VeiledError {
     RequestStillOpen,
     #[msg("New handle is identical to the current one")]
     SameHandle,
+    #[msg("Confidential requests need a nonzero amount commitment")]
+    MissingAmountCommitment,
 }
