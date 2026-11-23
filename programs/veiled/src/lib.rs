@@ -918,7 +918,8 @@ pub mod veiled {
     // ---- Request-to-pay ----
 
     /// Opens a request-to-pay, the record behind a shareable Veiled link or QR
-    /// code, with an expiry that must be in the future. A public request
+    /// code, with an expiry that must be in the future and no more than
+    /// `MAX_REQUEST_LIFETIME` away. A public request
     /// stores a nonzero `amount`. A confidential one stores only
     /// `amount_commitment`, a keccak256 hash of the amount and a blinding
     /// value; any `amount` passed with it is ignored and saved as zero. The
@@ -934,6 +935,10 @@ pub mod veiled {
     ) -> Result<()> {
         let now = Clock::get()?.unix_timestamp;
         require!(expires_at > now, VeiledError::InvalidExpiry);
+        require!(
+            expires_at - now <= MAX_REQUEST_LIFETIME,
+            VeiledError::InvalidExpiry
+        );
         require!(is_confidential || amount > 0, VeiledError::InvalidSpendAmount);
         // An all-zero commitment is what plain requests store, and nobody can
         // find an amount and blinding value that hash to it, so a confidential

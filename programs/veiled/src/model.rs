@@ -16,6 +16,10 @@ pub const MAX_FEE_TIERS: usize = 8;
 pub const BPS: u64 = 10_000;
 /// Length of an agent's daily spend window, in seconds (24 hours).
 pub const WINDOW_SECONDS: i64 = 86_400;
+/// Longest a payment request can stay payable, in seconds (90 days). Keeps
+/// forgotten links from lingering for years and lets requesters reclaim
+/// rent on open requests within a reasonable time.
+pub const MAX_REQUEST_LIFETIME: i64 = 90 * 86_400;
 
 // Seed prefixes for each PDA type. These bytes are part of every derived
 // address, so changing one would orphan all existing accounts of that type.
