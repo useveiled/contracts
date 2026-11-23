@@ -367,11 +367,7 @@ pub mod veiled {
         handle: String,
         account_kind: AccountKind,
     ) -> Result<()> {
-        require!(
-            !handle.is_empty() && handle.len() <= MAX_HANDLE_LEN,
-            VeiledError::InvalidHandleLength
-        );
-        require!(is_valid_handle(&handle), VeiledError::InvalidHandleCharacters);
+        validate_handle(&handle)?;
         let now = Clock::get()?.unix_timestamp;
 
         let profile = &mut ctx.accounts.profile;
@@ -403,11 +399,7 @@ pub mod veiled {
     /// is closed so another user can take that name, and nothing else on the
     /// profile changes apart from its update time.
     pub fn change_handle(ctx: Context<ChangeHandle>, new_handle: String) -> Result<()> {
-        require!(
-            !new_handle.is_empty() && new_handle.len() <= MAX_HANDLE_LEN,
-            VeiledError::InvalidHandleLength
-        );
-        require!(is_valid_handle(&new_handle), VeiledError::InvalidHandleCharacters);
+        validate_handle(&new_handle)?;
         let now = Clock::get()?.unix_timestamp;
 
         let profile = &mut ctx.accounts.profile;
@@ -1451,7 +1443,11 @@ pub struct ChangeHandle<'info> {
         mut,
         seeds = [PROFILE_SEED, owner.key().as_ref()],
         bump = profile.bump,
-        constraint = profile.owner == owner.key() @ VeiledError::Unauthorized
+        constraint = profile.owner == owner.key() @ VeiledError::Unauthorized,
+        // Checked here rather than in the handler because the claim accounts
+        // below are validated first, and renaming to the same handle would
+        // otherwise surface as an unhelpful "already in use" init failure.
+        constraint = profile.handle != new_handle @ VeiledError::SameHandle
     )]
     pub profile: Account<'info, Profile>,
     /// Claim account for the handle being given up. It is closed and its rent

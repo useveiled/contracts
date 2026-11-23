@@ -328,3 +328,18 @@ pub fn is_valid_handle(handle: &str) -> bool {
         .bytes()
         .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == b'_')
 }
+
+/// Full check for a handle about to be claimed: length first, then the
+/// character set. Shared by profile creation and handle changes so both
+/// reject the same inputs with the same errors.
+pub fn validate_handle(handle: &str) -> Result<()> {
+    require!(
+        !handle.is_empty() && handle.len() <= MAX_HANDLE_LEN,
+        crate::codes::VeiledError::InvalidHandleLength
+    );
+    require!(
+        is_valid_handle(handle),
+        crate::codes::VeiledError::InvalidHandleCharacters
+    );
+    Ok(())
+}

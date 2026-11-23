@@ -79,4 +79,6 @@ pub enum VeiledError {
     EmptyAllowlist,
     #[msg("Open requests cannot be closed until they expire")]
     RequestStillOpen,
+    #[msg("New handle is identical to the current one")]
+    SameHandle,
 }
