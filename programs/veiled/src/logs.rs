@@ -62,6 +62,15 @@ pub struct AgentStatusChanged {
     pub timestamp: i64,
 }
 
+/// The owner gave an agent a new label.
+#[event]
+pub struct AgentLabelUpdated {
+    pub agent: Pubkey,
+    pub previous_label: String,
+    pub new_label: String,
+    pub timestamp: i64,
+}
+
 /// The owner swapped the key an agent signs with.
 #[event]
 pub struct AgentSignerRotated {

@@ -572,6 +572,29 @@ pub mod veiled {
         Ok(())
     }
 
+    /// Owner only. Renames an agent. The label is display-only and not part of
+    /// any seed, so this touches nothing but the label and the update time.
+    /// Revoked agents keep the name they had when they were shut down.
+    pub fn set_agent_label(ctx: Context<OwnerAgent>, label: String) -> Result<()> {
+        require!(
+            !label.is_empty() && label.len() <= MAX_LABEL_LEN,
+            VeiledError::InvalidLabelLength
+        );
+        let agent = &mut ctx.accounts.agent;
+        require!(agent.status != AgentStatus::Revoked, VeiledError::AgentAlreadyRevoked);
+
+        let now = Clock::get()?.unix_timestamp;
+        let previous = std::mem::replace(&mut agent.label, label.clone());
+        agent.updated_at = now;
+        emit!(AgentLabelUpdated {
+            agent: agent.key(),
+            previous_label: previous,
+            new_label: label,
+            timestamp: now,
+        });
+        Ok(())
+    }
+
     /// Owner only. Points the agent at a new signing key. The vault, limits
     /// and today's spend total stay as they are, so a leaked key can be
     /// replaced without shutting the agent down for good.
