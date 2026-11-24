@@ -1903,3 +1903,87 @@ pub struct FileDisclosure<'info> {
     pub receipt: Account<'info, DisclosureReceipt>,
     pub system_program: Program<'info, System>,
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn handle_rules() {
+        assert!(validate_handle("john").is_ok());
+        assert!(validate_handle("gwen_stacy_99").is_ok());
+        assert!(validate_handle(&"a".repeat(MAX_HANDLE_LEN)).is_ok());
+
+        assert!(validate_handle("").is_err());
+        assert!(validate_handle(&"a".repeat(MAX_HANDLE_LEN + 1)).is_err());
+        assert!(validate_handle("John").is_err());
+        assert!(validate_handle("john.veiled").is_err());
+        assert!(validate_handle("j\u{f6}hn").is_err());
+    }
+
+    #[test]
+    fn limit_rules() {
+        assert!(validate_limits(100, 1_000, 50, false, 0).is_ok());
+        assert!(validate_limits(1_000, 1_000, 50, true, 1).is_ok());
+
+        // Zero values.
+        assert!(validate_limits(100, 1_000, 0, false, 0).is_err());
+        assert!(validate_limits(0, 1_000, 50, false, 0).is_err());
+        assert!(validate_limits(100, 0, 50, false, 0).is_err());
+        // Per-transaction limit above the daily one.
+        assert!(validate_limits(1_001, 1_000, 50, false, 0).is_err());
+        // Allowlist too long, or switched on while empty.
+        assert!(validate_limits(100, 1_000, 50, true, MAX_ALLOWED_RECIPIENTS + 1).is_err());
+        assert!(validate_limits(100, 1_000, 50, true, 0).is_err());
+    }
+
+    fn test_agent(window_start: i64, window_spent: u64, allowlist: Vec<Pubkey>) -> Agent {
+        Agent {
+            owner: Pubkey::default(),
+            agent_signer: Pubkey::default(),
+            label: "test".to_string(),
+            autonomy_tier: AutonomyTier::FullyAutonomous,
+            status: AgentStatus::Active,
+            mint: Pubkey::default(),
+            per_tx_limit: 100,
+            daily_limit: 1_000,
+            hitl_threshold: 50,
+            window_start,
+            window_spent,
+            allowlist_enabled: !allowlist.is_empty(),
+            allowed_recipients: allowlist,
+            pending_count: 0,
+            index: 0,
+            created_at: 0,
+            updated_at: 0,
+            bump: 0,
+            vault_bump: 0,
+        }
+    }
+
+    #[test]
+    fn window_rolls_only_after_a_full_day() {
+        let mut agent = test_agent(1_000, 400, vec![]);
+        roll_window(&mut agent, 1_000 + WINDOW_SECONDS - 1);
+        assert_eq!(agent.window_spent, 400);
+        assert_eq!(agent.window_start, 1_000);
+
+        let later = 1_000 + WINDOW_SECONDS;
+        roll_window(&mut agent, later);
+        assert_eq!(agent.window_spent, 0);
+        assert_eq!(agent.window_start, later);
+    }
+
+    #[test]
+    fn allowlist_checks() {
+        let allowed = Pubkey::new_unique();
+        let stranger = Pubkey::new_unique();
+
+        let open = test_agent(0, 0, vec![]);
+        assert!(check_allowlist(&open, &stranger).is_ok());
+
+        let locked = test_agent(0, 0, vec![allowed]);
+        assert!(check_allowlist(&locked, &allowed).is_ok());
+        assert!(check_allowlist(&locked, &stranger).is_err());
+    }
+}
