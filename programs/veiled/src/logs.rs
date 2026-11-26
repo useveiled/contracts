@@ -144,6 +144,14 @@ pub struct PendingPaymentApproved {
     pub timestamp: i64,
 }
 
+/// The agent withdrew a spend it had queued; nothing was paid.
+#[event]
+pub struct PendingPaymentCancelled {
+    pub agent: Pubkey,
+    pub pending_index: u64,
+    pub timestamp: i64,
+}
+
 /// The owner turned down a queued spend; nothing was paid.
 #[event]
 pub struct PendingPaymentRejected {

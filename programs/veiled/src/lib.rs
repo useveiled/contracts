@@ -959,6 +959,20 @@ pub mod veiled {
         Ok(())
     }
 
+    /// Signed by the agent key. Pulls back a spend the agent queued, for
+    /// example because the invoice was paid some other way or was wrong. The
+    /// record is closed and its rent goes back to the current agent key, which
+    /// is the key that paid for it unless the signer was rotated in between.
+    /// Works while the protocol is paused, since it moves no tokens.
+    pub fn cancel_pending(ctx: Context<CancelPending>) -> Result<()> {
+        emit!(PendingPaymentCancelled {
+            agent: ctx.accounts.agent.key(),
+            pending_index: ctx.accounts.pending.index,
+            timestamp: Clock::get()?.unix_timestamp,
+        });
+        Ok(())
+    }
+
     // ---- Request-to-pay ----
 
     /// Opens a request-to-pay, the record behind a shareable Veiled link or QR
@@ -1804,6 +1818,26 @@ pub struct RejectPending<'info> {
     #[account(
         mut,
         close = owner,
+        seeds = [PENDING_SEED, agent.key().as_ref(), &pending.index.to_le_bytes()],
+        bump = pending.bump,
+        constraint = pending.agent == agent.key() @ VeiledError::Unauthorized
+    )]
+    pub pending: Account<'info, PendingApproval>,
+}
+
+#[derive(Accounts)]
+pub struct CancelPending<'info> {
+    #[account(mut)]
+    pub agent_signer: Signer<'info>,
+    #[account(
+        seeds = [AGENT_SEED, agent.owner.as_ref(), &agent.index.to_le_bytes()],
+        bump = agent.bump,
+        constraint = agent.agent_signer == agent_signer.key() @ VeiledError::UnauthorizedAgentSigner
+    )]
+    pub agent: Account<'info, Agent>,
+    #[account(
+        mut,
+        close = agent_signer,
         seeds = [PENDING_SEED, agent.key().as_ref(), &pending.index.to_le_bytes()],
         bump = pending.bump,
         constraint = pending.agent == agent.key() @ VeiledError::Unauthorized
