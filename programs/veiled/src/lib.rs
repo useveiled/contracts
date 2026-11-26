@@ -572,6 +572,27 @@ pub mod veiled {
         Ok(())
     }
 
+    /// Owner only. Moves an agent to a different autonomy tier, for example
+    /// loosening a Supervised agent once it has earned some trust, or pulling
+    /// a misbehaving one back to Supervised without pausing it. Spends already
+    /// sitting in the queue are unaffected and still need the owner's call.
+    pub fn set_autonomy_tier(ctx: Context<OwnerAgent>, autonomy_tier: AutonomyTier) -> Result<()> {
+        let agent = &mut ctx.accounts.agent;
+        require!(agent.status != AgentStatus::Revoked, VeiledError::AgentAlreadyRevoked);
+
+        let now = Clock::get()?.unix_timestamp;
+        let previous = agent.autonomy_tier;
+        agent.autonomy_tier = autonomy_tier;
+        agent.updated_at = now;
+        emit!(AgentAutonomyChanged {
+            agent: agent.key(),
+            previous_tier: previous,
+            new_tier: autonomy_tier,
+            timestamp: now,
+        });
+        Ok(())
+    }
+
     /// Owner only. Renames an agent. The label is display-only and not part of
     /// any seed, so this touches nothing but the label and the update time.
     /// Revoked agents keep the name they had when they were shut down.

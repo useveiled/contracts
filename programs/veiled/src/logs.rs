@@ -62,6 +62,15 @@ pub struct AgentStatusChanged {
     pub timestamp: i64,
 }
 
+/// The owner moved an agent to a different autonomy tier.
+#[event]
+pub struct AgentAutonomyChanged {
+    pub agent: Pubkey,
+    pub previous_tier: AutonomyTier,
+    pub new_tier: AutonomyTier,
+    pub timestamp: i64,
+}
+
 /// The owner gave an agent a new label.
 #[event]
 pub struct AgentLabelUpdated {
